@@ -1,0 +1,1477 @@
+---
+title: "Computational Statistics Final Project"
+author: "Group 27"
+date: "14 October 2018"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+---
+#Project 2: Kinase-substrate prediction using phosphoproteomics datasets
+Aim: Prediction is a central application in many real-world data analyses. In this project, we will
+aim to apply classification techniques for predicting novel kinase-substrates.
+
+Objective: Design a predictive model for identifying novel Akt and
+mTOR substrates using the InsulinPhospho.txt, AUC_Ins.txt, Akt_substrates.txt and mTOR_substrates.txt datasets.
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# 1. Import all required libraries for analysis
+```{r import libraries}
+library(ggplot2)
+library(mlbench)
+library(randomForest)
+library(caret)
+library(scatterplot3d)
+library(MASS)
+library(gbm)
+library(class)
+library(dplyr)
+library(Hmisc)
+library(xgboost)
+library(MLmetrics)
+library(mice)
+library(tidyverse)
+library(corrplot)
+library(e1071)
+source("3_RebuiltAdasamplingFunctions.R")
+source("functions.R")
+source("3_RebuiltAdasamplingFunctions_SVM.R")
+
+
+```
+
+
+# 2. Import required datasets for analysis. 
+```{r Import datasets}
+InsulinPhospho <- read.csv("./Data2/Datasets/InsulinPhospho.txt", sep="\t") # Main temporal phosphoproteomics data.
+AUC_Ins <- read.csv("./Data2/Datasets/AUC_Ins.txt", sep="\t") # Secondary temporal phosphoproteomics data.
+
+Akt_Substrates <- read.csv("./Data2/Datasets/Akt_substrates.txt", header = F) # Identifiers of known Akt substrates.
+mTOR_Substrates <- read.csv("./Data2/Datasets/mTOR_substrates.txt", header = F) # Identifiers of known mTOR substrates.
+
+# Name the column of Akt and mTOR dataframes.
+names(Akt_Substrates) <- "Identifier"
+names(mTOR_Substrates) <- "Identifier"
+```
+
+
+# 3. Explore datasets using the summary, describe and dim functions.
+```{r}
+summary(InsulinPhospho)
+describe(InsulinPhospho)
+dim(InsulinPhospho)
+
+summary(AUC_Ins)
+describe(AUC_Ins)
+dim(AUC_Ins)
+
+summary(Akt_Substrates)
+describe(Akt_Substrates)
+dim(Akt_Substrates)
+
+summary(mTOR_Substrates)
+describe(mTOR_Substrates)
+dim(mTOR_Substrates)
+```
+
+## 3.1 Check if AUC_Ins is useful
+Both temporal phosphoproteomics dataframe contain the same number of rows (samples), with different numbers of columns (features). Check to see that the secondary temporal phosphoproteomics dataframe (AUC_Ins) contains different data to InsulinPhospho.
+```{r}
+test <- AUC_Ins %>% merge(InsulinPhospho, by="Identifier") # Merge the dataframes using their unique identifier to join on.
+
+# Create a dataframe where AUC_Ins features = InsulinPhospho features.
+test %>% dplyr::select(Identifier, Seq.Window.x, Seq.Window.y, AUC.x, AUC.y) %>% filter(Seq.Window.x == Seq.Window.y | AUC.x == AUC.y) 
+
+dim(test) # test has 12,062 rows (the same number of rows as InsulinPhospho). This shows that AUC_Ins contains no new data.
+
+rm(test) #drop the test data.frame since we don't actually need it.
+
+# There is no need to consider data from AUC_Ins because it is contained within InsulinPhospho.
+```
+
+## 3.2 Create a combined master data set
+Identifiers for known Akt_substrates and mTOR_substrates are found in Akt_substrates and mTOR_substrates data sets.Append known substrates fields to InsulinPhospho columns to create a master data set.
+```{r}
+dat <- InsulinPhospho #Name master data set.
+
+# Add Akt Substrates to dat
+dat$aktSubstrate <- 0 # Add new column of zeros to dat for aktSubstrate
+dat$aktSubstrate[dat$Identifier %in% Akt_Substrates$Identifier] <- 1 # Label rows with known AktSubstrates with a 1.
+dat$aktSubstrate <- as.factor(dat$aktSubstrate) # Change labels to factors.
+dat %>% filter(aktSubstrate == 1) # There should be 22 Akt Substrates. Check to make sure this is the case.
+
+# Repeating the same process as above for mTOR substrates:
+dat$mTORSubstrate <- 0
+dat$mTORSubstrate[dat$Identifier %in% mTOR_Substrates$Identifier] <- 1
+dat %>% filter(mTORSubstrate == 1) # There should be 26 Akt Substrates. Check to make sure this is the case.
+dat$mTORSubstrate <- as.factor(dat$mTORSubstrate)
+
+# Check for NAs in the master dataset, to identify whether imputation or field/record removal is required
+sum(is.na(dat)) # No NA's in dataset. No imputation or data removal required.
+```
+
+# 4. Baseline Classification models
+Feature creation,integration (and selection if necessary)
+Feature selection does not need to be considered for a random forest model. Random forest shows how important each feasture is with its gini index. However, we would like to perform feature selection to see if there are existence any of dominant features
+
+Feature selection is done to attempt alternate methods.
+## 4.1 Baseline random forest model
+Create a baseline random forest model for prediction of Akt substrates and mTOR substrates
+```{r Create folds}
+# Create a subset dataframe that contains samples with known Akt or mTOR (i.e. exclude all unlabelled samples).
+# Remove identifier, seq. window and mTOR substrate flag from subset.
+known.dat <- dat[dat$aktSubstrate == 1 | dat$mTORSubstrate == 1, c(-1,-2,-18)]
+# This subset dataframe is reasonably balanced in term of Akt (22) and mTOR (26) samples so there is no need for up or down sampling for the baseline.
+
+# Determine the maximum number of predictors that can be used in the random forest
+max.predictors <- length(colnames(known.dat)) - 1 # Substracting one as the last column is the response variable
+
+set.seed(1) # Set seed to randomise the rows included in each fold
+folds <- createFolds(known.dat[,"aktSubstrate"], 10) # Create 10 folds for cross validation
+
+# Create a matrix to hold the results from the baseline random forest.
+# Trail from 1 to 100 number of trees (number of rows = 100)
+# Trail from 1 to max.predictors randomly sampled canditate variables for each split
+gridSearchResults <- matrix(nrow=100, ncol=max.predictors)
+
+
+for (m in 1:100){
+  for(k in 1:max.predictors){
+    
+    fold.accuracy <- NULL
+    
+    for (tst in folds){
+      
+      known.dat.train = known.dat[-tst,]
+      known.dat.test = known.dat[tst,]
+      
+      rf.Baseline <- randomForest(aktSubstrate~., data=known.dat.train,  mtry=k, replace=TRUE, importance=TRUE, ntree=m)
+    
+      ypred <-  predict(rf.Baseline, newdata=known.dat.test)
+      ypred.accuracy <- sum(ypred == known.dat.test$aktSubstrate)/nrow(known.dat.test)
+      
+      if (is.null(fold.accuracy)){
+        fold.accuracy <-  ypred.accuracy
+        
+      }
+      else {
+        fold.accuracy <- fold.accuracy + ypred.accuracy
+        
+      }
+      
+      #print(ypred.accuracy)
+    }
+    avg.accuracy <- fold.accuracy / length(folds)
+    gridSearchResults[m, k] <-  avg.accuracy
+    
+  }
+}
+```
+
+## 4.2 Summarise and visualise the Random Forrest results
+Baseline random forest model predicts aktSubstrate from mTOR with accuracy of 81.5% (min) to 97.5% (max) using existing 14 features
+```{r Plot results of rf.baseline}
+summary(gridSearchResults) # Summaries the model results
+
+library(plotly)
+p <- plot_ly(z = ~gridSearchResults) %>% add_surface()
+p
+```
+
+## 4.3 Baseline SVM model
+
+### 4.3.1 Baseline SVM model - The aktSubstrate as class
+```{r}
+names(dat)[c(1,2,18)] 
+# create an index to remember which rows are positively labelled as akt
+aktIdx = which(dat$aktSubstrate==1)  
+# create an index to remember which rows are positively labelled as mTOR
+mTORIdx = which(dat$mTORSubstrate==1) 
+
+aktSubstrate.dat <- dat[c(-1,-2,-18)]
+# keep a copy for comparison later since we overwrite this feature in the line below
+aktSubstrate.dat$aktSubstrate_Original = aktSubstrate.dat$aktSubstrate 
+# this does not make "0" into 0, and "1" into 1
+aktSubstrate.dat$aktSubstrate = as.numeric(as.factor(aktSubstrate.dat$aktSubstrate)) 
+
+aktSubstrate.dat$aktSubstrate_corrected = as.numeric(as.factor(aktSubstrate.dat$aktSubstrate)) - 1
+
+dfCompare <- data.frame(aktSubstrate.dat$aktSubstrate_Original, aktSubstrate.dat$aktSubstrate, aktSubstrate.dat$aktSubstrate_corrected)
+
+names(dfCompare) <- c("Original", "Factor to Numeric Conversion", "Corrected")
+
+# let's take a look at the original field, the numeric conversion, and the corrected numerical conversion.
+# Note: The column types are listed under the column names, [factor, double, double]
+dfCompare
+
+dim(aktSubstrate.dat)
+```
+
+```{r}
+aktSubstrate_data.mat <- apply(X = aktSubstrate.dat[,-(15:17)], MARGIN = 2, FUN =  as.numeric) 
+
+aktSubstrate_data.mat <- aktSubstrate_data.mat[c(aktIdx,mTORIdx),]#TKP Need to remove the unlabelled items, otherwise the class imbalance is too large for the SVM to train.
+
+aktSubstrate_known.dat<- aktSubstrate_data.mat
+
+attr(aktSubstrate_data.mat, "dimnames")[2]
+
+data.cls.truth <- sapply(X = aktSubstrate.dat$aktSubstrate_corrected, FUN = function(x) {ifelse(x=="1", 1, 0)}) # try with the corrected truth class instead
+
+data.cls.truth_akt <- data.cls.truth[c(aktIdx,mTORIdx)] # Need to match the indexed rows
+
+rownames(aktSubstrate_data.mat) <- paste("p", 1:nrow(aktSubstrate_data.mat), sep="_")
+
+#data.cls.truth
+
+
+k <- 10
+set.seed(1)
+fold <- createFolds(data.cls.truth_akt, 10);
+# gold standard (orignal data)
+TP <- TN <- FP <- FN <- c()
+for(i in 1:length(fold)){
+
+    model <- svm(aktSubstrate_data.mat[-fold[[i]],], data.cls.truth_akt[-fold[[i]]])
+    preds <- ifelse(predict(model, aktSubstrate_data.mat[fold[[i]],]) > 0.5, 1, 0)
+    TP <- c(TP, sum((data.cls.truth_akt[fold[[i]]] == preds)[data.cls.truth_akt[fold[[i]]] == "1"]))
+    TN <- c(TN, sum((data.cls.truth_akt[fold[[i]]] == preds)[data.cls.truth_akt[fold[[i]]] == "0"]))
+    FP <- c(FP, sum((data.cls.truth_akt[fold[[i]]] != preds)[preds == "1"]))
+    FN <- c(FN, sum((data.cls.truth_akt[fold[[i]]] != preds)[preds == "0"]))
+    
+}
+mean(F1(cbind(TN, FP, TP, FN)))
+mean(Sen(cbind(TN, FP, TP, FN)))
+mean(Spe(cbind(TN, FP, TP, FN)))
+mean(Acc(cbind(TN, FP, TP, FN)))
+```
+
+### 4.3.2 Baseline SVM model - The mTORSubstrate as class
+```{r}
+mTORSubstrate.dat <- dat[c(-1,-2,-17)]
+# keep a copy for comparison later since we overwrite this feature in the line below
+mTORSubstrate.dat$mTORSubstrate_Original = mTORSubstrate.dat$mTORSubstrate 
+# this does not make "0" into 0, and "1" into 1
+mTORSubstrate.dat$mTORSubstrate = as.numeric(as.factor(mTORSubstrate.dat$mTORSubstrate)) 
+
+mTORSubstrate.dat$mTORSubstrate_corrected = as.numeric(as.factor(mTORSubstrate.dat$mTORSubstrate)) - 1
+
+dfCompare <- data.frame(mTORSubstrate.dat$mTORSubstrate_Original, mTORSubstrate.dat$mTORSubstrate, mTORSubstrate.dat$mTORSubstrate_corrected)
+
+names(dfCompare) <- c("Original", "Factor to Numeric Conversion", "Corrected")
+
+# let's take a look at the original field, the numeric conversion, and the corrected numerical conversion.
+# Note: The column types are listed under the column names, [factor, double, double]
+dfCompare
+
+dim(mTORSubstrate.dat)
+```
+
+```{r}
+mTORSubstrate_data.mat <- apply(X = mTORSubstrate.dat[,-(15:17)], MARGIN = 2, FUN =  as.numeric) #TKP slightly modified to also drop cols 16 and 17 since I added two additional columns to create dfCompare above.
+
+mTORSubstrate_data.mat <- mTORSubstrate_data.mat[c(aktIdx,mTORIdx),]#TKP Need to remove the unlabelled items, otherwise the class imbalance is too large for the SVM to train.
+
+mTORSubstrate_known.dat<- mTORSubstrate_data.mat
+
+attr(mTORSubstrate_data.mat, "dimnames")[2]
+
+data.cls.truth_mTOR <- sapply(X = mTORSubstrate.dat$mTORSubstrate_corrected, FUN = function(x) {ifelse(x=="1", 1, 0)}) #TKP try with the corrected truth class instead
+
+data.cls.truth_mTOR <- data.cls.truth_mTOR[c(aktIdx,mTORIdx)] # Need to match the indexed rows
+
+rownames(mTORSubstrate_data.mat) <- paste("p", 1:nrow(mTORSubstrate_data.mat), sep="_")
+
+#data.cls.truth
+
+k <- 10
+set.seed(1)
+fold <- createFolds(data.cls.truth_mTOR, 10);
+# gold standard (orignal data)
+TP <- TN <- FP <- FN <- c()
+for(i in 1:length(fold)){
+    model <- svm(mTORSubstrate_data.mat[-fold[[i]],], data.cls.truth_mTOR[-fold[[i]]])
+    preds <- ifelse(predict(model, mTORSubstrate_data.mat[fold[[i]],]) > 0.5, 1, 0)
+    TP <- c(TP, sum((data.cls.truth_mTOR[fold[[i]]] == preds)[data.cls.truth_mTOR[fold[[i]]] == "1"]))
+    TN <- c(TN, sum((data.cls.truth_mTOR[fold[[i]]] == preds)[data.cls.truth_mTOR[fold[[i]]] == "0"]))
+    FP <- c(FP, sum((data.cls.truth_mTOR[fold[[i]]] != preds)[preds == "1"]))
+    FN <- c(FN, sum((data.cls.truth_mTOR[fold[[i]]] != preds)[preds == "0"]))
+}
+mean(F1(cbind(TN, FP, TP, FN)))
+mean(Sen(cbind(TN, FP, TP, FN)))
+mean(Spe(cbind(TN, FP, TP, FN)))
+mean(Acc(cbind(TN, FP, TP, FN)))
+```
+
+## 4.4 Feature selection - Wrapper methods using KNN
+(The aktSubstrate as class)
+```{r}
+selectFeature <- function(train, test, cls.train, cls.test, features) {
+  ## identify a feature to be selected
+  current.best.accuracy <- -Inf
+  selected.i <- NULL
+  for(i in 1:ncol(train)) {
+    current.f <- colnames(train)[i]
+    if(!current.f %in% features) {
+      model <- knn(train=train[,c(features, current.f)], test=test[,c(features, current.f)], cl=cls.train, k=3)
+      test.acc <- sum(model == cls.test) / length(cls.test)
+      
+      if(test.acc > current.best.accuracy) {
+        current.best.accuracy <- test.acc
+        selected.i <- colnames(train)[i]
+      }
+    }
+  }
+  return(selected.i)
+}
+
+
+library(caret)
+set.seed(1)
+inTrain <- createDataPartition(data.cls.truth_akt, p = .6)[[1]]
+allFeatures <- colnames(aktSubstrate_data.mat)
+train <- aktSubstrate_data.mat[ inTrain,]
+test  <- aktSubstrate_data.mat[-inTrain,]
+cls.train <- data.cls.truth_akt[inTrain]
+cls.test <- data.cls.truth_akt[-inTrain]
+
+# use correlation to determine the first feature
+cls.train.numeric <- rep(c(0, 1), c(sum(cls.train == "0"), sum(cls.train == "1")))
+features <- c()
+current.best.cor <- 0
+for(i in 1:ncol(train)) {
+  if(current.best.cor < abs(cor(train[,i], cls.train.numeric))) {
+    current.best.cor <- abs(cor(train[,i], cls.train.numeric))
+    features <- colnames(train)[i]
+  }
+}
+print(features)
+
+for (j in 2:10) {
+  selected.i <- selectFeature(train, test, cls.train, cls.test, features)
+  print(selected.i)
+
+  # add the best feature from current run
+  features <- c(features, selected.i)
+}
+
+features_selection_aktSubstrate_data.mat <- aktSubstrate_data.mat[,features]
+
+k <- 10
+set.seed(1)
+fold <- createFolds(data.cls.truth_akt, 10);
+# gold standard (orignal data)
+TP <- TN <- FP <- FN <- c()
+for(i in 1:length(fold)){
+  
+    model <- svm(features_selection_aktSubstrate_data.mat[-fold[[i]],], data.cls.truth_akt[-fold[[i]]])
+    preds <- ifelse(predict(model, features_selection_aktSubstrate_data.mat[fold[[i]],]) > 0.5, 1, 0)
+    TP <- c(TP, sum((data.cls.truth_akt[fold[[i]]] == preds)[data.cls.truth_akt[fold[[i]]] == "1"]))
+    TN <- c(TN, sum((data.cls.truth_akt[fold[[i]]] == preds)[data.cls.truth_akt[fold[[i]]] == "0"]))
+    FP <- c(FP, sum((data.cls.truth_akt[fold[[i]]] != preds)[preds == "1"]))
+    FN <- c(FN, sum((data.cls.truth_akt[fold[[i]]] != preds)[preds == "0"]))
+    
+}
+mean(F1(cbind(TN, FP, TP, FN)))
+mean(Sen(cbind(TN, FP, TP, FN)))
+mean(Spe(cbind(TN, FP, TP, FN)))
+mean(Acc(cbind(TN, FP, TP, FN)))
+```
+
+The feature selection doesn't make sense or have a higher accuracy based on known samples
+
+## 4.5 Feature selection - Wrapper methods using KNN
+(The mTORSubstrate as class)
+```{r}
+set.seed(1)
+inTrain <- createDataPartition(data.cls.truth_mTOR, p = .6)[[1]]
+allFeatures <- colnames(mTORSubstrate_data.mat)
+train <- mTORSubstrate_data.mat[ inTrain,]
+test  <- mTORSubstrate_data.mat[-inTrain,]
+cls.train <- data.cls.truth_mTOR[inTrain]
+cls.test <- data.cls.truth_mTOR[-inTrain]
+
+# use correlation to determine the first feature
+cls.train.numeric <- rep(c(0, 1), c(sum(cls.train == "0"), sum(cls.train == "1")))
+features <- c()
+current.best.cor <- 0
+for(i in 1:ncol(train)) {
+  if(current.best.cor < abs(cor(train[,i], cls.train.numeric))) {
+    current.best.cor <- abs(cor(train[,i], cls.train.numeric))
+    features <- colnames(train)[i]
+  }
+}
+print(features)
+
+for (j in 2:10) {
+  selected.i <- selectFeature(train, test, cls.train, cls.test, features)
+  print(selected.i)
+
+  # add the best feature from current run
+  features <- c(features, selected.i)
+}
+
+features_selection_mTORSubstrate_data.mat <- mTORSubstrate_data.mat[,features]
+
+k <- 10
+set.seed(1)
+fold <- createFolds(data.cls.truth_mTOR, 10);
+# gold standard (orignal data)
+TP <- TN <- FP <- FN <- c()
+for(i in 1:length(fold)){
+  
+    model <- svm(features_selection_mTORSubstrate_data.mat[-fold[[i]],], data.cls.truth_mTOR[-fold[[i]]])
+    preds <- ifelse(predict(model, features_selection_mTORSubstrate_data.mat[fold[[i]],]) > 0.5, 1, 0)
+    TP <- c(TP, sum((data.cls.truth_mTOR[fold[[i]]] == preds)[data.cls.truth_mTOR[fold[[i]]] == "1"]))
+    TN <- c(TN, sum((data.cls.truth_mTOR[fold[[i]]] == preds)[data.cls.truth_mTOR[fold[[i]]] == "0"]))
+    FP <- c(FP, sum((data.cls.truth_mTOR[fold[[i]]] != preds)[preds == "1"]))
+    FN <- c(FN, sum((data.cls.truth_mTOR[fold[[i]]] != preds)[preds == "0"]))
+    
+}
+mean(F1(cbind(TN, FP, TP, FN)))
+mean(Sen(cbind(TN, FP, TP, FN)))
+mean(Spe(cbind(TN, FP, TP, FN)))
+mean(Acc(cbind(TN, FP, TP, FN)))
+```
+
+The feature selection doesn't make sense or have a higher accuracy based on known samples
+
+## 4.6 Baseline Logistic regression model for aktSubstrate class
+```{r Baseline Logistic regression model}
+glm.akt<-glm(dat$aktSubstrate~dat$Avg.Fold+dat$AUC+dat$X15s+dat$X30s+dat$X1m+dat$X2m+dat$X5m+dat$X10m+dat$X20m+dat$X60m+dat$Ins.1+dat$LY+dat$Ins.2+dat$MK,data=dat,family = binomial)
+summary(glm.akt)
+```
+
+## 4.7 Feature selection using stepwise for aktSubstrate class
+```{r stepwise feature selection}
+#feature selection to build the model step by step
+glm.akt1<-step(glm.akt)
+summary(glm.akt1)
+
+#explain the model
+coef(glm.akt1)
+exp(glm.akt1$coefficients)#the relationship between odds and x
+exp(confint(glm.akt1))#Confidence interval
+xp0.5<-0/glm.akt1$coefficients[]
+xp0.5#return x which makes pi equal to 0.5
+ratio05<-glm.akt1$coefficients[]*0.25
+ratio05
+
+```
+## 4.8 Evaluate Logistic Regession baseline model for aktSubstrate class
+```{r}
+#evaluate the model
+R2cox<-1-exp((glm.akt1$deviance-glm.akt1$null.deviance)/length(dat$aktSubstrate))
+cat("Cox-Snell R2=",R2cox,"\n")
+R2nag<-R2cox/(1-exp((-glm.akt1$null.deviance)/length(dat$aktSubstrate)))
+R2nag
+cat("Nagelkerke R2=",R2nag,"\n")
+plot(residuals(glm.akt1))
+#install.packages('car')
+library(car)
+influencePlot(glm.akt1)
+```
+
+Sumary of evaluation:
+```{r}
+fitted.pi<-fitted(glm.akt1)
+ypred<-1*(fitted.pi>0.5)
+length(ypred)
+n<-table(dat$aktSubstrate,ypred)
+n
+cat("sensitivity=",n[1,1]/sum(n[,1]),"\n")
+cat("specificity=",n[1,1]/sum(n[1,]),"\n")
+```
+
+
+## 4.9 Baseline Logistic regression model for mTORSubstrate class
+```{r Baseline Logistic regression model for mTORSubstrate class}
+#create the logistic regression taking all the features
+glm.mtor<-glm(dat$mTORSubstrate~dat$Avg.Fold+dat$AUC+dat$X15s+dat$X30s+dat$X1m+dat$X2m+dat$X5m+dat$X10m+dat$X20m+dat$X60m+dat$Ins.1+dat$LY+dat$Ins.2+dat$MK,data=dat,family = binomial)
+summary(glm.mtor)
+```
+
+## 4.10 Feature selection using stepwise for mTORSubstrate class
+```{r}
+#feature selection to build the model step by step
+glm.mtor1<-step(glm.mtor)
+summary(glm.mtor1)
+
+#explain the model
+coef(glm.mtor1)
+exp(glm.mtor1$coefficients)#the relationship between odds and x
+exp(confint(glm.mtor1))#Confidence interval
+xp0.5<-0/glm.mtor1$coefficients[]
+xp0.5#return x which makes pi equal to 0.5
+ratio05<-glm.mtor1$coefficients[]*0.25
+ratio05
+
+```
+## 4.11 Evaluate Logistic Regession baseline model for mTORSubstrate class
+```{r}
+#evaluate the model
+R2cox<-1-exp((glm.mtor1$deviance-glm.mtor1$null.deviance)/length(dat$mTORSubstrate))
+cat("Cox-Snell R2=",R2cox,"\n")
+R2nag<-R2cox/(1-exp((-glm.mtor1$null.deviance)/length(dat$mTORSubstrate)))
+R2nag
+cat("Nagelkerke R2=",R2nag,"\n")
+plot(residuals(glm.mtor1))
+library(car)
+influencePlot(glm.mtor1)
+```
+
+Sumary of evaluation:
+```{r}
+fitted.pi<-fitted(glm.mtor1)
+ypred<-1*(fitted.pi>0.5)
+length(ypred)
+n<-table(dat$mTORSubstrate,ypred)
+n
+cat("sensitivity=",n[1,1]/sum(n[,1]),"\n")
+cat("specificity=",n[1,1]/sum(n[1,]),"\n")
+```
+
+# 5. Visualisation 
+Below are the list of Visualisation attempted
+a) Visualise the data to understand patterns between the features, and identify potential new features.
+b) Visualise the log2 time-series insulin stimulated phosphorylation profiles fold change.
+c) Scatter plots
+d) Violin plots
+e) Kernal desity plots
+
+
+```{r}
+library(reshape)
+
+# Create a dataframe of the time series data, renaming the time columns to allow for ordering.
+dat.timeseries <- dat
+dat.timeseries <- dat.timeseries %>% dplyr::rename("1" = "X15s")
+dat.timeseries <- dat.timeseries %>% dplyr::rename("2" = "X30s")
+dat.timeseries <- dat.timeseries %>% dplyr::rename("3" = "X1m")
+dat.timeseries <- dat.timeseries %>% dplyr::rename("4" = "X2m")
+dat.timeseries <- dat.timeseries %>% dplyr::rename("5" = "X5m")
+dat.timeseries <- dat.timeseries %>% dplyr::rename("6" = "X10m")
+dat.timeseries <- dat.timeseries %>% dplyr::rename("7" = "X20m")
+dat.timeseries <- dat.timeseries %>% dplyr::rename("8" = "X60m")
+
+# Use melt to stack all the time-series data into a single column for plotting. Order dataframe by Identifier.
+my.result <- melt(dat.timeseries, id = c("Identifier","Seq.Window","Avg.Fold", "AUC","Ins.1","LY","Ins.2","MK","aktSubstrate","mTORSubstrate")) 
+my.result <- my.result[order(my.result$Identifier),]
+
+# The time-series profiles start at different y values. Adjust all y values to start at zero. This allows for an "apples to apples comparison" of the time-series.
+my.result.var1 <- my.result %>% filter(variable == 1) %>% select(Identifier, value)
+my.result2 <- my.result %>% merge(my.result.var1, by="Identifier", all.x=TRUE) %>% mutate(value.offset = value.x - value.y)
+
+```
+
+## 5.1 Plot Time-series response curves for Akt and mTOR
+Plot the time-series response curves for Akt and mTOR to check for differences between the two.
+```{r}
+
+ggplot(my.result2 %>% filter(aktSubstrate==1 | mTORSubstrate == 1))+
+  geom_line(aes(x=variable, y=value.offset, colour = aktSubstrate, group=Identifier))
+```
+
+A notable difference can be seen between the Akt (1) and mTOR (0) reponse curves between 1 (time = 15s) and 6 (time=10mins). Beyond 6 (time=10mins) both response curse apear to have a similar flat/negative response.
+
+## 5.2 Replot Time-series response curves using mean of Akt and mTOR
+Replot the above graph taking the mean of Akt and mTOR. Include error bars of 1 standard deviation.
+```{r}
+
+# Use group-by to combine Akt and mTOR samples at each time interval and calculate the mean and standard deviation.
+my.result2.grouped <- my.result2 %>% group_by(aktSubstrate, mTORSubstrate, variable) %>% dplyr::summarize(value.offset.mn = mean(value.offset), value.offset.var = var(value.offset)) %>% data.frame %>% mutate(value.offset.sd = sqrt(value.offset.var))
+
+# Filter for rows containing know Akt and mTOR substrates (i.e. remove all unknown rows)
+my.result2.grouped
+my.result2.grouped %>% filter(aktSubstrate == 1 | mTORSubstrate == 1)
+
+# Plot mean response including 1 standard deviation bar.
+ggplot(my.result2.grouped %>% filter(aktSubstrate==1 | mTORSubstrate == 1))+
+  geom_point(aes(x=variable, y=value.offset.mn, colour = aktSubstrate, group=aktSubstrate)) +
+  geom_line(aes(x=variable, y=value.offset.mn, colour = aktSubstrate, group=aktSubstrate)) +
+  geom_errorbar(width=.4, aes(x=variable,ymin=value.offset.mn-value.offset.sd, ymax=value.offset.mn+value.offset.sd,colour=aktSubstrate))
+```
+
+The first four time segments (1 - 4) show distinctly different responses. Beyound time segment 4 the responses between Akt and mTOR are less distinct.
+
+## 5.3 Inference from visualisations
+Use visualisations to investigate if any patterns exist between Ins.1, LY, Ins.2, MK responses.
+```{r}
+# features are not time based. Use master dataframe "dat"
+
+cat.dat <- dat %>% mutate(Type = case_when(aktSubstrate==1~"Akt", mTORSubstrate == 1~"mTOR", TRUE~"Other"))  %>% select(Identifier, Seq.Window, Avg.Fold, AUC, Ins.1, LY, Ins.2, MK, aktSubstrate, mTORSubstrate, Type)
+
+colnames(cat.dat)
+head(cat.dat)
+```
+
+Use cat.dat to check the distributions of the categorical features.
+
+## 5.4 Check scatter plot of Ins.1, LY
+Draw scatter plots of Ins.1 and LY to see if the features exhibit any noticeable difference between Akt and mTOR that may help differentiate between them.
+```{r Check scatter plot of Ins.1, LY and Ins.2, MK}
+
+sp <- ggplot(cat.dat) +
+  geom_point(aes(x=Ins.1, y=LY, color=Type)) +
+  xlab("Ins.1") +
+  ylab("LY") +
+  theme_light()
+
+sp
+```
+
+## 5.5 Check scatter plot of Ins.2, MK
+Draw scatter plots of Ins.2 and MK to see if the features exhibit any noticeable difference between Akt and mTOR that may help differentiate between them.
+```{r }
+sp <- ggplot(cat.dat) +
+  geom_point(aes(x=Ins.2, y=MK, color=Type)) +
+  xlab("Ins.2") +
+  ylab("MK") +
+  theme_light()
+
+sp
+```
+
+## 5.6 Check scatter plot of Ins.2, Ins.1
+```{r Check scatter plot of Ins.2, Ins.1}
+sp <- ggplot(cat.dat) +
+  geom_point(aes(x=Ins.2, y=Ins.1, color=Type)) +
+  xlab("Ins.1") +
+  ylab("Ins.2") +
+  theme_light()
+
+sp
+```
+
+## 5.7 Check scatter plot of LY, MK
+```{r Check scatter plot of LY, MK}
+sp <- ggplot(cat.dat) +
+  geom_point(aes(x=Ins.2, y=MK, color=Type)) +
+  xlab("Ins.2") +
+  ylab("MK") +
+  theme_light()
+
+sp
+```
+
+## 5.8 Check boxplot and violin plot of Avg.Fold by akt Substrate
+```{r Check boxplot of Avg.Fold by akt Substrate, fig.height=7, fig.width=5}
+require(gridExtra)
+
+p1 <- ggplot(cat.dat) +
+  geom_boxplot(aes(x=Type, y=Avg.Fold, color=Type)) +
+  xlab("Type") +
+  ylab("Avg.Fold") +
+  ggtitle("Box Plot") + 
+  theme_light()
+
+p2 <- ggplot(cat.dat) +
+  geom_violin(aes(x=Type, y=Avg.Fold, color=Type), scale = "area") +
+  xlab("Type") +
+  ylab("AUC") +
+  ggtitle("Violin Plot") + 
+  theme_light()
+
+grid.arrange(p1, p2, ncol=1)
+```
+
+## 5.9 Check boxplot and violin plot of AUC by akt Substrate
+```{r Check boxplot of AUC by akt Substrate, fig.height=7, fig.width=5}
+p1 <- ggplot(cat.dat) +
+  geom_boxplot(aes(x=Type, y=AUC, color=Type)) +
+  xlab("Type") +
+  ylab("AUC") +
+  ggtitle("Box Plot") + 
+  theme_light()
+
+p2 <- ggplot(cat.dat) +
+  geom_violin(aes(x=Type, y=AUC, color=Type), scale = "area") +
+  xlab("Type") +
+  ylab("AUC") +
+  ggtitle("Violin Plot") + 
+  theme_light()
+
+grid.arrange(p1, p2, ncol=1)
+```
+
+Akt and mTOR exhibit quite a significant difference in AUC, which is another statistic that comes from the shape of the Akt and mTOR response curves.
+
+# 6. kernal desnity of substrate
+## 6.1 Plot the kernal desnity of AUC by substrate.
+```{r Check kernel density of AUC by akt Substrate, another way to plot the distribution of AUC for each type}
+p1 <- ggplot(cat.dat) +
+  geom_density(aes(x=AUC, color=Type), n=1000, bw=0.025, trim=F) +
+  scale_x_discrete(name="Type", limits=c(0,0.25,0.5,0.75,1.0,1.25)) +
+  xlab("Type") +
+  ylab("AUC") +
+  ggtitle("Kernel Density of AUC") + 
+  theme_light()
+
+p1
+```
+
+## 6.2 Plot the kernal desnity of Avg.fold by substrate.
+```{r Check kernel density of Avg.Fold by akt Substrate}
+p1 <- ggplot(cat.dat) +
+  geom_density(aes(x=Avg.Fold, color=Type), n=1000, trim=F) +
+  
+  xlab("Type") +
+  ylab("Avg.Fold") +
+  ggtitle("Kernel Density of Avg.Fold") + 
+  theme_light()
+
+p1
+```
+
+# 7. Feature generation
+The sequence window column contains the sequence of the phosphorylation site. It is a 13-amino acid sequence in which the 7th position corresponds to the amino acid that is phosphorylated.
+```{r Breakout seq.window}
+require(stringr)
+
+cat.dat$Seq.Window <- as.character(cat.dat$Seq.Window)
+
+str_length(cat.dat[1,]$Seq.Window)
+
+# Create a new column for each of the each of the amino acids.
+cat.dat$s1 <- as.factor(str_sub( cat.dat$Seq.Window, 1,1))
+cat.dat$s2 <- as.factor(str_sub( cat.dat$Seq.Window, 2,2))
+cat.dat$s3 <- as.factor(str_sub( cat.dat$Seq.Window, 3,3))
+cat.dat$s4 <- as.factor(str_sub( cat.dat$Seq.Window, 4,4))
+cat.dat$s5 <- as.factor(str_sub( cat.dat$Seq.Window, 5,5))
+cat.dat$s6 <- as.factor(str_sub( cat.dat$Seq.Window, 6,6))
+cat.dat$s7 <- as.factor(str_sub( cat.dat$Seq.Window, 7,7))
+cat.dat$s8 <- as.factor(str_sub( cat.dat$Seq.Window, 8,8))
+cat.dat$s9 <- as.factor(str_sub( cat.dat$Seq.Window, 9,9))
+cat.dat$s10 <- as.factor(str_sub( cat.dat$Seq.Window, 10,10))
+cat.dat$s11 <- as.factor(str_sub( cat.dat$Seq.Window, 11,11))
+cat.dat$s12 <- as.factor(str_sub( cat.dat$Seq.Window, 12,12))
+cat.dat$s13 <- as.factor(str_sub( cat.dat$Seq.Window, 13,13))
+```
+
+## 7.1 Visualise  each seq character in the seq window
+Generate plots for each seq character in the seq window position from position 1 to 13
+```{r Generate plots for each seq character in the seq window position from position 1 to 13}
+for (seqName in colnames(cat.dat)[12:24]){
+  myplot <- ggplot(cat.dat, aes_string(x=seqName, group = "Type")) +
+            geom_bar(aes(y = ..prop.., fill = Type), stat="count") +
+            scale_y_continuous(labels=scales::percent) +
+            ylab("relative frequencies") +
+            ggtitle(seqName)+
+            facet_grid(~Type)
+
+
+  # myplot
+
+  plotFilename <- paste("./Plots/seq_",seqName,".png",sep="_")
+  ggsave(plotFilename, myplot, dpi=320, device="png")
+
+  print(paste("saved plot to: ",plotFilename," ...",sep=""))
+
+}
+```
+
+Some sequence character character positions show patterns with their amino acid profile (e.g. 45% of S1 for Akt are F)
+
+## 7.2 Create additional features
+Now that the visual exploration of the data is complete additional features can be created to improve classification
+```{r Create some additional features based on exploratory data analysis above.}
+# Add two additional features to the master dataframe
+#1. The rate of change in response.
+#2. The amino acid for each of the thirteen positions.
+dat.extra <- dat %>% mutate(diffP1 = X30s - X15s,
+                            diffP2 = X1m - X30s,
+                            diffP3 = X2m - X1m,
+                            diffP4 = X5m - X2m,
+                            diffP5 = X10m - X5m,
+                            diffP6 = X20m - X10m,
+                            diffP7 = X60m - X20m,
+                            Type = as.factor(case_when(aktSubstrate==1~"Akt", mTORSubstrate == 1~"mTOR", TRUE~"Other")),
+                            s1 = as.factor(str_sub( Seq.Window, 1,1)),
+                            s2 = as.factor(str_sub( Seq.Window, 2,2)),
+                            s3 = as.factor(str_sub( Seq.Window, 3,3)),
+                            s4 = as.factor(str_sub( Seq.Window, 4,4)),
+                            s5 = as.factor(str_sub( Seq.Window, 5,5)),
+                            s6 = as.factor(str_sub( Seq.Window, 6,6)),
+                            s7 = as.factor(str_sub( Seq.Window, 7,7)),
+                            s8 = as.factor(str_sub( Seq.Window, 8,8)),
+                            s9 = as.factor(str_sub( Seq.Window, 9,9)),
+                            s10 = as.factor(str_sub( Seq.Window, 10,10)),
+                            s11 = as.factor(str_sub( Seq.Window, 11,11)),
+                            s12 = as.factor(str_sub( Seq.Window, 12,12)),
+                            s13 = as.factor(str_sub( Seq.Window, 13,13))
+                            )
+
+
+```
+
+# 8. Revised random forest model using new features
+Test the influence of the new features on the accuracy of the random forest model by comparing to the baseline accuracy.
+```{r Remove all unlabelled samples for this test to see whether the additional features are useful for model performance}
+# Use identical procedure as the baseline so the influence of the new feasures can be compared to the baseline
+dat.extra.rf <- dat.extra %>% filter(Type != "Other") %>% select(-Identifier, -Seq.Window, -mTORSubstrate, -Type)
+folds <- createFolds(dat.extra.rf$aktSubstrate, 10)
+
+
+```
+
+## 8.1 Grid search to find best parameters
+```{r Execute a grid search between 1 to 100 trees, and 1 to 34 candidate predictors available for each split using 10 fold CV }
+max.predictors.dat.extra <- length(colnames(dat.extra.rf))-1
+
+gridSearchResults.extra <- matrix(nrow=100, ncol=max.predictors.dat.extra)
+
+
+for (m in 1:100){
+  for(k in 1:max.predictors.dat.extra){
+
+  fold.accuracy <- NULL
+  
+  for (tst in folds){
+    
+    dat.extra.rf.train = dat.extra.rf[-tst,]
+    dat.extra.rf.test = dat.extra.rf[tst,]
+    
+    rf.ExtraFeatures <- randomForest(aktSubstrate~., data=dat.extra.rf.train,  mtry=k, replace=TRUE, importance=TRUE, ntree=m) # importance based on 
+  
+    ypred.prob <-  predict(rf.ExtraFeatures, newdata=dat.extra.rf.test, type="prob")
+    ypred <- ifelse(ypred.prob[,2] > 0.5, 1, 0)
+    ypred.accuracy <- sum(ypred == dat.extra.rf.test$aktSubstrate)/nrow(dat.extra.rf.test)
+    
+    if (is.null(fold.accuracy)){
+      fold.accuracy <-  ypred.accuracy
+      
+    }
+    else {
+      fold.accuracy <- fold.accuracy + ypred.accuracy
+      
+    }
+  
+    }
+    avg.accuracy <- fold.accuracy / length(folds)
+
+    avg.accuracy    
+
+    gridSearchResults.extra[m, k] <-  avg.accuracy
+    
+  }
+}
+
+View(gridSearchResults.extra)
+# 5 trees and 4 predictors is all that's needed
+  
+```
+
+## 8.2 Visualise Grid search reults of Revised Random forrest model
+```{r 3D Plot results of rf.extra model, and find the best model based on accuracy, noting that number of class samples in this scenario are not too imbalanced.}
+require(plotly)
+
+p.extra <- plot_ly(z = ~gridSearchResults.extra) %>% add_surface()
+p.extra
+
+rf.ExtraFeatures$importance
+
+max(gridSearchResults.extra)
+```
+
+## 8.3 Summary
+Below is the summary of Radom Forrest model and proposal for next steps.
+a) The average out of bag (OOB) estimate of error rate decreases from 9.09% to 6.98% with the new features added.
+b) Some mtry and number of tree configurations achieve 100% accuracy.
+c) Apply adaptive sampling procedure to the dataset in order to classify the unlabled data.
+
+# 9. Alternative classification methods
+Alternative methods to benchmark and compare with Adapative sampling approach using SVM 
+```{r}
+
+# combine all results for analysis.
+result.final <- c()
+
+```
+
+## 9.1 Run AdaSampling using using SVM
+Perform predictions using SVM for both aktSubstrate and mTorSubstrate
+## 9.1.1 AdaSampling (svm) predictions for aktSubstrate class
+```{r}
+
+dat$Identifier <- NULL
+dat$Seq.Window <-NULL
+
+# create an index to remember which rows are positively labelled as akt
+aktIdx = which(dat$aktSubstrate==1) 
+# create an index to remember which rows are positively labelled as mTOR
+mTORIdx = which(dat$mTORSubstrate==1) 
+
+aktSubstrate.dat <- dat[c(-1,-2,-16)]
+
+aktSubstrate.dat$aktSubstrate_Original = aktSubstrate.dat$aktSubstrate 
+
+# this does not make "0" into 0, and "1" into 1
+aktSubstrate.dat$aktSubstrate = as.numeric(as.factor(aktSubstrate.dat$aktSubstrate)) 
+
+aktSubstrate.dat$aktSubstrate_corrected = as.numeric(as.factor(aktSubstrate.dat$aktSubstrate)) - 1
+
+dfCompare <- data.frame(aktSubstrate.dat$aktSubstrate_Original, aktSubstrate.dat$aktSubstrate, aktSubstrate.dat$aktSubstrate_corrected)
+
+names(dfCompare) <- c("Original", "Factor to Numeric Conversion", "Corrected")
+
+# let's take a look at the original field, the numeric conversion, and the corrected numerical conversion.
+# Note: The column types are listed under the column names, [factor, double, double]
+dfCompare
+
+dim(aktSubstrate.dat)
+```
+
+```{r}
+dim(aktSubstrate.dat)
+aktSubstrate.dat[1:2,]
+aktSubstrate.dat <- aktSubstrate.dat[,-c(13:14)]
+data.cls.truth <- aktSubstrate.dat$aktSubstrate_corrected
+k = 10
+set.seed(1)
+fold=createFolds(data.cls.truth, k)
+TP <- TN <- FP <- FN <- c()
+for (i in 1:length(fold)){
+  train.mat = aktSubstrate.dat[-fold[[i]],]
+  test.mat = aktSubstrate.dat[fold[[i]],]
+  cls = data.cls.truth[-fold[[i]]]
+  
+  #index positive and genative instances
+  Ps = rownames(train.mat)[which(cls == 1)]
+  Ns = rownames(train.mat)[which(cls == 0)]
+  
+  pred.prob = adaSample_SVM(Ps, Ns, train.mat, test.mat, classifier = "svm", cost=1, gamma=0.01)
+  pred = ifelse(pred.prob[, "P"] >0.5, 1, 0)
+  
+  TP <- c(TP, sum((data.cls.truth[fold[[i]]] == pred)[data.cls.truth[fold[[i]]] == "1"]))
+  TN <- c(TN, sum((data.cls.truth[fold[[i]]] == pred)[data.cls.truth[fold[[i]]] == "0"]))
+  FP <- c(FP, sum((data.cls.truth[fold[[i]]] != pred)[pred == "1"]))
+  FN <- c(FN, sum((data.cls.truth[fold[[i]]] != pred)[pred == "0"]))
+}
+
+mean(F1(cbind(TN, FP, TP, FN)))
+mean(Sen(cbind(TN, FP, TP, FN)))
+mean(Spe(cbind(TN, FP, TP, FN)))
+mean(Acc(cbind(TN, FP, TP, FN)))
+
+result.final <- rbind(result.final, c("AdaSampling (svm)", "Akt", 
+                  mean(F1(cbind(TN, FP, TP, FN))),
+                  mean(Acc(cbind(TN, FP, TP, FN))),
+                  mean(Sen(cbind(TN, FP, TP, FN))),
+                  mean(Spe(cbind(TN, FP, TP, FN)))))
+
+
+posLikeRatio = mean(Sen(cbind(TN, FP, TP, FN)))/1-mean(Spe(cbind(TN, FP, TP, FN)))
+paste("AdaSampling (svm) for.Akt - Positive Likelihood Ratio = ",posLikeRatio)
+
+```
+
+## 9.1.2 AdaSampling (svm) predictions for mTORSubstrate class
+```{r}
+mTORSubstrate.dat <- dat[c(-1,-2,-15)]
+mTORSubstrate.dat$mTORSubstrate_Original = mTORSubstrate.dat$mTORSubstrate # TKP keep a copy for comparison later since we overwrite this feature in the line below
+mTORSubstrate.dat$mTORSubstrate = as.numeric(as.factor(mTORSubstrate.dat$mTORSubstrate)) #TKP this does not make "0" into 0, and "1" into 1
+
+
+## TKP code ##
+mTORSubstrate.dat$mTORSubstrate_corrected = as.numeric(as.factor(mTORSubstrate.dat$mTORSubstrate)) - 1
+
+dfCompare <- data.frame(mTORSubstrate.dat$mTORSubstrate_Original, mTORSubstrate.dat$mTORSubstrate, mTORSubstrate.dat$mTORSubstrate_corrected)
+
+names(dfCompare) <- c("Original", "Factor to Numeric Conversion", "Corrected")
+
+# let's take a look at the original field, the numeric conversion, and the corrected numerical conversion.
+# Note: The column types are listed under the column names, [factor, double, double]
+dfCompare
+
+
+## TKP code end ##
+
+dim(mTORSubstrate.dat)
+```
+```{r}
+mTORSubstrate.dat <- mTORSubstrate.dat[,-c(13:14)]
+data.cls.truth <- mTORSubstrate.dat$mTORSubstrate_corrected
+k = 10
+set.seed(1)
+fold=createFolds(data.cls.truth, k)
+TP <- TN <- FP <- FN <- c()
+for (i in 1:length(fold)){
+  train.mat = mTORSubstrate.dat[-fold[[i]],]
+  test.mat = mTORSubstrate.dat[fold[[i]],]
+  cls = data.cls.truth[-fold[[i]]]
+  
+  #index positive and genative instances
+  Ps = rownames(train.mat)[which(cls == 1)]
+  Ns = rownames(train.mat)[which(cls == 0)]
+  
+  pred.prob = adaSample_SVM(Ps, Ns, train.mat, test.mat, classifier = "svm", cost=1, gamma=0.01)
+  pred = ifelse(pred.prob[, "P"] >0.5, 1, 0)
+  
+  TP <- c(TP, sum((data.cls.truth[fold[[i]]] == pred)[data.cls.truth[fold[[i]]] == "1"]))
+  TN <- c(TN, sum((data.cls.truth[fold[[i]]] == pred)[data.cls.truth[fold[[i]]] == "0"]))
+  FP <- c(FP, sum((data.cls.truth[fold[[i]]] != pred)[pred == "1"]))
+  FN <- c(FN, sum((data.cls.truth[fold[[i]]] != pred)[pred == "0"]))
+}
+
+mean(F1(cbind(TN, FP, TP, FN)))
+mean(Sen(cbind(TN, FP, TP, FN)))
+mean(Spe(cbind(TN, FP, TP, FN)))
+mean(Acc(cbind(TN, FP, TP, FN)))
+
+# add to result.final
+result.final <- rbind(result.final,c("AdaSampling (svm)", "mToR", 
+                  mean(F1(cbind(TN, FP, TP, FN))),
+                  mean(Acc(cbind(TN, FP, TP, FN))),
+                  mean(Sen(cbind(TN, FP, TP, FN))),
+                  mean(Spe(cbind(TN, FP, TP, FN)))))
+
+posLikeRatio = mean(Sen(cbind(TN, FP, TP, FN)))/1-mean(Spe(cbind(TN, FP, TP, FN)))
+paste("AdaSampling (svm) for mToR - Positive Likelihood Ratio = ",posLikeRatio)
+```
+
+## 9.2 Ada Sampling using KNN for aktSubstrate class
+```{r Ada Sampling using KNN for aktSubstrate class}
+library(caret)
+set.seed(1)
+inTrain <- createDataPartition(dat$aktSubstrate, p = .8)[[1]]
+dataTrain <- dat[ inTrain, ]
+dataTest  <- dat[-inTrain, ]
+
+dat.cls <- dat$aktSubstrate
+pos <- which(dat.cls == 1)
+neg <- which(dat.cls == 0)
+Ps <- rownames(dataTrain)[which(dataTrain$aktSubstrate == 1)]
+Ns <- rownames(dataTrain)[which(dataTrain$aktSubstrate == 0)]
+#install.packages('AdaSampling')
+library(AdaSampling)
+dat.preds <- adaSample(Ps, Ns, train.mat=dataTrain, test.mat=dataTest, classifier = "knn")
+head(dat.preds)
+
+# Accuracy after applying AdaSampling method
+accuracyWithAdaSample <- sum(ifelse(dat.preds[,"P"] > 0.5, 1, 0) == dataTrain$aktSubstrate) / length(dataTrain$aktSubstrate)
+paste("Accuracy of Adasampling using KNN for Akt: ",accuracyWithAdaSample)
+
+pred = ifelse(dat.preds[,"P"] > 0.5, 1, 0)
+
+TP <- sum((dataTrain$aktSubstrate == pred)[dataTrain$aktSubstrate == "1"])
+TN <- sum((dataTrain$aktSubstrate == pred)[dataTrain$aktSubstrate == "0"])
+FP <- sum((dataTrain$aktSubstrate != pred)[pred == "1"])
+FN <- sum((dataTrain$aktSubstrate != pred)[pred == "0"])
+
+# add to result.final
+result.final <- rbind(result.final,c("AdaSampling (knn)", "Akt", 
+                  F1(cbind(TN, FP, TP, FN)),
+                  Acc(cbind(TN, FP, TP, FN)),
+                  Sen(cbind(TN, FP, TP, FN)),
+                  Spe(cbind(TN, FP, TP, FN))))
+mean(Spe(cbind(TN, FP, TP, FN)))
+
+posLikeRatio = Sen(cbind(TN, FP, TP, FN))/1-Spe(cbind(TN, FP, TP, FN))
+paste("AdaSampling (knn) for Akt - Positive Likelihood Ratio = ",posLikeRatio)
+
+```
+
+## 9.3 Ada Sampling using KNN for mTORSubstrate class
+```{r Ada Sampling using KNN for mTORSubstrate class}
+library(caret)
+set.seed(1)
+inTrain <- createDataPartition(dat$mTORSubstrate, p = .8)[[1]]
+dataTrain <- dat[ inTrain, ]
+dataTest  <- dat[-inTrain, ]
+
+dat.cls <- dat$mTORSubstrate
+pos <- which(dat.cls == 1)
+neg <- which(dat.cls == 0)
+Ps <- rownames(dataTrain)[which(dataTrain$mTORSubstrate == 1)]
+Ns <- rownames(dataTrain)[which(dataTrain$mTORSubstrate == 0)]
+
+library(AdaSampling)
+dat.preds <- adaSample(Ps, Ns, train.mat=dataTrain, test.mat=dataTest, classifier = "knn")
+head(dat.preds)
+
+# Accuracy after applying AdaSampling method
+accuracyWithAdaSample <- sum(ifelse(dat.preds[,"P"] > 0.5, 1, 0) == dataTrain$mTORSubstrate) / length(dataTrain$mTORSubstrate)
+paste("Accuracy of Adasampling using KNN for mTor: ",accuracyWithAdaSample)
+
+pred = ifelse(dat.preds[,"P"] > 0.5, 1, 0)
+
+TP <- sum((dataTrain$mTORSubstrate == pred)[dataTrain$mTORSubstrate == "1"])
+TN <- sum((dataTrain$mTORSubstrate == pred)[dataTrain$mTORSubstrate == "0"])
+FP <- sum((dataTrain$mTORSubstrate != pred)[pred == "1"])
+FN <- sum((dataTrain$mTORSubstrate != pred)[pred == "0"])
+
+# add to result.final
+result.final <- rbind(result.final,c("AdaSampling (knn)", "mToR", 
+                  F1(cbind(TN, FP, TP, FN)),
+                  Acc(cbind(TN, FP, TP, FN)),
+                  Sen(cbind(TN, FP, TP, FN)),
+                  Spe(cbind(TN, FP, TP, FN))))
+
+posLikeRatio = Sen(cbind(TN, FP, TP, FN))/1-Spe(cbind(TN, FP, TP, FN))
+paste("AdaSampling (knn) for mToR - Positive Likelihood Ratio = ",posLikeRatio)
+
+
+```
+
+# 10. Proposed classification procedure - AdaSampling using Random Forrest (Note: This code takes hours to run!!!)
+Adapative sampling assigns probability to the unlabaled data of being positive (e.g. Akt) or negative (e.g. not Akt). Once the class probability of the unlabeled data is assigned it is then fed back into the model (in this case random forest) to give the model additional data, ideally resulting in better model accuracy.
+
+## 10.1 Prepare Akt substrate dataset for AdaSampling
+Prepare dataset for AdaSampling for Akt Substrate (mTOR substrate will have a different dataset
+```{r Prepare dataset for AdaSampling for Akt Substrate (mTOR substrate will have a different dataset)}
+dat.extra.ada <- dat.extra %>% select(-Seq.Window, -Type) # Remove sequence window and type features.
+
+# Explicitly store the Identifier into a separate matrix to reference back later.
+rowNameToIdentifierMap <- data.frame(rownames(dat.extra.ada), dat.extra.ada$Identifier)
+names(rowNameToIdentifierMap) <- c("rowName", "Identifier")
+
+dat.extra.ada$Identifier <- NULL # Remove Identifier column (each identifier is unique and not useful for classification)
+
+# Save the positive (Akt) and negative (mTOR / unknown) classes to a separate dataframe for use in AdaSample. Postive and negative classes are indexed in the adaSampleWrapperRF fucntion.
+dat.extra.ada.akt_cls <- dat.extra.ada$aktSubstrate
+dat.extra.ada.mtor_cls <- dat.extra.ada$mTORSubstrate
+
+# Drop the labels from the dat.extra.ada dataframe
+dat.extra.ada$aktSubstrate <-NULL
+dat.extra.ada$mTORSubstrate <-NULL
+
+colnames(dat.extra.ada)
+```
+
+
+## 10.2 Run AdaSampling for Akt substrates (using larger increments)
+Run Ada Sample Wrapper function for Akt substrates over the 10 adafolds, identify a good set of mtry and ntree parameters using gridsearch methodology
+Note: This code takes hours to run!!!
+
+```{r Run Ada Sample Wrapper function for Akt substrates over the 10 adafolds, identify a good set of mtry and ntree parameters using gridsearch methodology}
+set.seed(1) # Set seed to randomise the rows included in each fold.
+adafolds <- createFolds(dat.extra$aktSubstrate, k=10) # Create 10 folds for cross validation.
+
+resAll <- data.frame() # Create an empty dataframe to store sensitivity and specficity results.
+
+# Trail mtry (number of features to select from at each node) between 1 and 36 (36 = all features)
+# Trail number of trees between 100 and 1000 in increments of 100.
+# There is a large class imbalance (22 Akt vs. 12,040 mTOR/unknown). The adaSampleWrapperRF function samples an equal number of Akt and mTOR/unknown observations for each bag to balance the data when creating the random forest models.
+for (m in seq(1, dim(dat.extra.ada)[2], by=1)){
+  for (n in seq(100,1000,by=100)){
+  
+  print(paste("Executing Adasampling... Number of predictors:", m, "  |   Number of trees:", n, sep=" "))
+    score <- adaSampleWrapperRF(dat = dat.extra.ada, cls = dat.extra.ada.akt_cls, cls.known.neg = dat.extra.ada.mtor_cls, folds = adafolds, mtry=m, ntree=n)
+  
+  known.score <- data.frame(score[1],score[2]) # Sensitivity estimate using known samples.
+  all.score <- data.frame(score[3],score[4]) # Specificity using all samples.
+  
+  sen <- known.score %>% dplyr::filter(Metric=="sen") %>% select(Score)
+  spe <- all.score %>% dplyr::filter(Metric=="spe") %>% select(Score)
+  
+  res <- data.frame(m,n,sen,spe)
+  names(res) <- c("Number of Predictors (m)", "Number of Trees (n)", "Sensitivity on labelled samples", "Specificity on all samples (lower bound)")
+  
+  resAll <- rbind(resAll, res)
+  
+  }
+}
+  
+resAll
+names(resAll) <- c(names(resAll)[c(1,2)],'Sensitivity',"Specificity")
+```
+
+## 10.3 Assess the quality of the model (using larger increments)
+Assess the quality of the model using the positive and negative likleihood ratios
+```{r}
+# Overall we want posLikeRatio to be large, and negLikeRatio to be close to 0
+# Log the likeihood ratios so they can be added (instead of multiplied). A negative is placed in front of the log(negLikeRatio) to make it a positive when adding.
+resAll2 <- resAll %>% dplyr::select("Number of Predictors (m)", "Number of Trees (n)", Sensitivity, Specificity)
+
+resAll <- resAll2
+
+# Calculate log positive and negative likeihood ratios and add them as new columns in resAll
+resAll <- resAll %>%
+              mutate(posLikeRatio = Sensitivity/(1-Specificity),
+                     negLikeRatio = (1-Sensitivity)/Specificity) %>% 
+              mutate(logPosLikeRatio = log(posLikeRatio),
+                    negLogNegLikeRatio = -log(negLikeRatio)) %>%
+              mutate(combinedLogLikeRatio = logPosLikeRatio+negLogNegLikeRatio) %>%
+              arrange(desc(logPosLikeRatio)) # sort by posLikeRatio
+
+max(resAll$Sensitivity)
+
+resAll
+```
+
+For Akt substrate the best performing model has 25 predictors and 800 trees.
+
+## 10.4 Grid search to find best performing model (using smaller increments)
+Trial number of predictors and ntrees in smaller increments around 25 and 800 respectively to find best performing model.
+Note: This code takes hours to run!
+```{r Run Ada Sample Wrapper function for Akt substrates over the 10 adafolds, identify a good set of mtry and ntree parameters using gridsearch methodology using smaller increments}
+set.seed(1) # Set seed to randomise the rows included in each fold.
+adafolds <- createFolds(dat.extra$aktSubstrate, k=10) # Create 10 folds for cross validation.
+
+resAll <- data.frame() # Create an empty dataframe to store sensitivity and specficity results.
+
+# Trail mtry (number of features to select from at each node) between 1 and 36 (36 = all features)
+# Trail number of trees between 100 and 1000 in increments of 100.
+# There is a large class imbalance (22 Akt vs. 12,040 mTOR/unknown). The adaSampleWrapperRF function samples an equal number of Akt and mTOR/unknown observations for each bag to balance the data when creating the random forest models.
+for (m in seq(20, 30, by=1)){
+  for (n in seq(750,850,by=10)){
+  
+  print(paste("Executing Adasampling... Number of predictors:", m, "  |   Number of trees:", n, sep=" "))
+    score <- adaSampleWrapperRF(dat = dat.extra.ada, cls = dat.extra.ada.akt_cls, cls.known.neg = dat.extra.ada.mtor_cls, folds = adafolds, mtry=m, ntree=n)
+  
+  known.score <- data.frame(score[1],score[2]) # Sensitivity estimate using known samples.
+  all.score <- data.frame(score[3],score[4]) # Specificity using all samples.
+  
+  sen <- known.score %>% dplyr::filter(Metric=="sen") %>% select(Score)
+  spe <- all.score %>% dplyr::filter(Metric=="spe") %>% select(Score)
+  
+  res <- data.frame(m,n,sen,spe)
+  names(res) <- c("Number of Predictors (m)", "Number of Trees (n)", "Sensitivity on labelled samples", "Specificity on all samples (lower bound)")
+  
+  resAll <- rbind(resAll, res)
+  
+  }
+}
+  
+resAll
+names(resAll) <- c(names(resAll)[c(1,2)],'Sensitivity',"Specificity")
+```
+
+## 10.5 Assess the quality of the model (using smaller increments)
+Assess the quality of the model using the positive and negative likelihood ratios
+```{r}
+# Overall we want posLikeRatio to be large, and negLikeRatio to be close to 0
+# Log the likeihood ratios so they can be added (instead of multiplied). A negative is placed in front of the log(negLikeRatio) to make it a positive when adding.
+resAll2 <- resAll %>% dplyr::select("Number of Predictors (m)", "Number of Trees (n)", Sensitivity, Specificity)
+
+resAll <- resAll2
+
+# Calculate log positive and negative likeihood rations and add them as new columns in resAll
+resAll <- resAll %>%
+              mutate(posLikeRatio = Sensitivity/(1-Specificity),
+                     negLikeRatio = (1-Sensitivity)/Specificity) %>% 
+              mutate(logPosLikeRatio = log(posLikeRatio),
+                    negLogNegLikeRatio = -log(negLikeRatio)) %>%
+              mutate(combinedLogLikeRatio = logPosLikeRatio+negLogNegLikeRatio) %>%
+              arrange(desc(logPosLikeRatio)) # sort by posLikeRatio
+
+max(resAll$Sensitivity)
+
+resAll
+```
+
+For Akt substrate the best performing model has32 predictors and 100 trees.
+
+## 10.6 Run AdaSampling for mTOR substrates (using larger increments)
+Repeat adaptive sampling process using positive = mTOR and negative = Akt/unknown 
+Note: This code takes hours to run!
+```{r Test Ada Sample Wrapper for mTOR substrates, note: swapped cls, to mTOR and cls.known.neg, to Akt}
+set.seed(1) # Set seed to randomise the rows included in each fold.
+adafolds.mTOR <- createFolds(dat.extra$mTORSubstrate, k=10) # Create 10 folds for cross validation.
+
+resAll.mTOR <- data.frame()
+
+for (m in seq(1, dim(dat.extra.ada)[2], by=1)){
+  for (n in seq(100,1000,by=100)){
+  
+  print(paste("Executing Adasampling... Number of predictors:", m, "  |   Number of trees:", n, sep=" "))
+    score <- adaSampleWrapperRF(dat = dat.extra.ada, cls = dat.extra.ada.mtor_cls, cls.known.neg = dat.extra.ada.akt_cls, folds = adafolds.mTOR, mtry=m, ntree=n)
+  
+  known.score <- data.frame(score[1],score[2])
+  all.score <- data.frame(score[3],score[4])
+  
+  sen <- known.score %>% dplyr::filter(Metric=="sen") %>% select(Score)
+  spe <- all.score %>% dplyr::filter(Metric=="spe") %>% select(Score)
+  
+  res <- data.frame(m,n,sen,spe)
+  names(res) <- c("Number of Predictors (m)", "Number of Trees (n)", "Sensitivity on labelled samples", "Specificity on all samples (lower bound)")
+  
+  resAll.mTOR <- rbind(resAll.mTOR, res)
+  
+  }
+}
+  
+resAll.mTOR
+names(resAll.mTOR) <- c(names(resAll.mTOR)[c(1,2)],'Sensitivity',"Specificity")
+```
+
+```{r}
+resAll.mTOR <- resAll.mTOR %>% dplyr::select("Number of Predictors (m)", "Number of Trees (n)", Sensitivity, Specificity)
+
+resAll.mTOR <- resAll.mTOR %>%
+              mutate(posLikeRatio = Sensitivity/(1-Specificity),
+                     negLikeRatio = (1-Sensitivity)/Specificity) %>%
+              mutate(logPosLikeRatio = log(posLikeRatio),
+                    negLogNegLikeRatio = -log(negLikeRatio)) %>%
+              mutate(combinedLogLikeRatio = logPosLikeRatio+negLogNegLikeRatio) %>%
+              arrange(desc(logPosLikeRatio))
+
+max(resAll.mTOR$Sensitivity)
+
+resAll.mTOR
+```
+
+For mTOR substrate the best performing model has 32 predictors and 100 trees.
+
+
+# 11. Validation and benchmark of prediction results
+Compare predictions to previous report.
+Use the best identified mtry and ntree values for generating a final adasample on the whole dataset.
+Truely, AdaSampling using Radom Forrest seems to better at handling class imbalace. Thefore it will be selected as winner and subsequent analysis will be made on this.
+
+## 11.1 Final AdaSampling model
+```{r Akt substrate prediction, ntree=800, mtry=25}
+# 
+# score <- adaSampleWrapperRF(dat = dat.extra.ada, cls = dat.extra.ada.mtor_cls, cls.known.neg = dat.extra.ada.akt_cls, folds = adafolds.mTOR, mtry=m, ntree=n)
+# 
+# trn.cls <- cls[-fold]
+# tst.cls <- cls[fold] # need to use to estimate sensitivity
+# 
+# tst.cls.known.neg <- cls.known.neg[fold] # Need to use to estimate lower bound for specificity
+# 
+# train.mat <- dat[-fold,]
+# test.mat <- dat[fold,]
+# cls <- dat.extra.ada.mtor_cls
+
+# Index positive and negative instances, this assumes all unlabeled samples are of the negative class
+Ps <- rownames(dat.extra.ada)[which(dat.extra.ada.akt_cls == 1)]
+Ns <- rownames(dat.extra.ada)[which(dat.extra.ada.akt_cls == 0)]
+
+## Perform AdaSampling on the Training Set and provide prediction on the test set
+# require(AdaSampling)
+pred.prob <- adaSample(Ps, Ns, dat.extra.ada, test=dat.extra.ada, classifier="rf", C=50, mtry=25, ntree=800)
+
+dim(pred.prob)
+head(pred.prob[,])
+
+sum(dat.extra.ada.akt_cls==1)
+
+
+# summary of predictions
+pred = ifelse(pred.prob[,"P"] > 0.5, 1, 0)
+
+TP <- sum((dat.extra.ada.akt_cls == pred)[dat.extra.ada.akt_cls == "1"])
+TN <- sum((dat.extra.ada.akt_cls == pred)[dat.extra.ada.akt_cls == "0"])
+FP <- sum((dat.extra.ada.akt_cls != pred)[pred == "1"])
+FN <- sum((dat.extra.ada.akt_cls != pred)[pred == "0"])
+
+# add to result.final
+result.final <- rbind(result.final,c("AdaSampling (Final)", "Combined", 
+                  F1(cbind(TN, FP, TP, FN)),
+                  Acc(cbind(TN, FP, TP, FN)),
+                  Sen(cbind(TN, FP, TP, FN)),
+                  Spe(cbind(TN, FP, TP, FN))))
+
+
+#head(dat.extra.ada.akt_cls)
+
+colnames(result.final) <- c("Classification model", "Substrate", "F1", "Accuracy",
+                         "Sensitivity", "Specificity")
+
+result.final
+
+posLikeRatio = Sen(cbind(TN, FP, TP, FN))/(1-Spe(cbind(TN, FP, TP, FN)))
+paste("AdaSampling (Final) - Positive Likelihood Ratio = ",posLikeRatio)
+```
+
+
+## 11.2 AdaSampling Akt predictions
+```{r}
+## Final PRedictions here
+
+colnames(rowNameToIdentifierMap)
+
+AktFinalPred <- data.frame(pred.prob,dat.extra.ada.akt_cls) %>% merge(rowNameToIdentifierMap, by.x="row.names", by.y="rowName") %>%arrange(desc(P)) %>% filter(dat.extra.ada.akt_cls == 0) 
+
+AktFinalPred %>% filter(grepl("IRS2", Identifier, fixed = TRUE ))
+
+InsulinPhospho %>% filter(grepl("CEP", Identifier, fixed = TRUE ))
+
+```
+
+## 11.3 Check the Akt class flag is consistent when compared to orginal dataset.
+```{r Check against original dataset, make sure the order of the dat.extra.ada.akt_cls flag is not wrong}
+data.frame(pred.prob,dat.extra.ada.akt_cls) %>% merge(rowNameToIdentifierMap, by.x="row.names", by.y="rowName") %>%arrange(desc(P)) %>% filter(dat.extra.ada.akt_cls == 1) %>% arrange(Identifier)
+
+dat.extra %>% filter(aktSubstrate==1)
+# dataframe has 22 rows, one for each of the Akt substrances. 
+```
+
+Generated final prediction probability in descending order, note the known one's are not useful, but only as a confirm that it is at least finding the positive labels...
+
+```{r}
+data.frame(pred.prob,dat.extra.ada.akt_cls) %>% merge(rowNameToIdentifierMap, by.x="row.names", by.y="rowName") %>%arrange(desc(P)) %>% select(-N, -Row.names) #Remove N since it is just 1 - P
+```
+
+## 11.4 AdaSampling mTOR predictions
+
+```{r mTOR substrate prediction, ntree=100, mtry=32}
+
+Ps <- rownames(dat.extra.ada)[which(dat.extra.ada.mtor_cls == 1)]
+Ns <- rownames(dat.extra.ada)[which(dat.extra.ada.mtor_cls == 0)]
+
+## Perform AdaSampling on the Training Set and provide prediction on the test set
+# require(AdaSampling)
+pred.prob.mTOR <- adaSample(Ps, Ns, dat.extra.ada, test=dat.extra.ada, classifier="rf", C=50, mtry=32, ntree=100)
+
+dim(pred.prob.mTOR)
+head(pred.prob.mTOR)
+
+sum(dat.extra.ada.mtor_cls==1)
+
+
+head(dat.extra.ada.mtor_cls)
+
+```
+
+## 11.5 Check the mTOR class flag is consistent when compared to orginal dataset.
+```{r Check against original dataset, make sure the order of the dat.extra.ada.mTOR_cls flag is not wrong}
+## Use for double checking identifiers
+data.frame(pred.prob.mTOR,dat.extra.ada.mtor_cls) %>% merge(rowNameToIdentifierMap, by.x="row.names", by.y="rowName") %>%arrange(desc(P)) %>% filter(dat.extra.ada.mtor_cls == 1) %>% arrange(Identifier)
+
+dat.extra %>% filter(mTORSubstrate==1)
+# dataframe has 26 rows, one for each of the Akt substrances.
+
+mTORFinalPred <- data.frame(pred.prob,dat.extra.ada.mtor_cls) %>% merge(rowNameToIdentifierMap, by.x="row.names", by.y="rowName") %>%arrange(desc(P)) %>% filter(dat.extra.ada.mtor_cls == 0) 
+```
+
+## 11.6 Compare the model predictions to the predictions of academic paper
+```{r }
+require(stringr)
+
+Prediction2016 <- readxl::read_excel("./Data2/Prediction_2016.xlsx")
+Prediction2016 <- Prediction2016 %>% mutate(Identifier=paste(str_to_upper(GeneSymbol),";" ,`Phosphorylation site`, ';', sep=""))
+```
+
+## 11.7 Benchmark of prediction results
+Note, the two datasets AktFinalPred and Prediction2016 appear to have different gene symbol, sites, although there is an intersect between the two.
+```{r Join the two tables on the Identifier field}
+# Join the model predictions to the prediction from the academic paper
+AktFinalPred %>% merge(Prediction2016%>% dplyr::select(Identifier, `Full model predict`), by="Identifier", all.x=T)
+
+# Add column to AktFinal for academic model prediction
+AktFinalPred$P.flag <- ifelse(AktFinalPred$P > 0.5, 1, 0)
+AktFinalPred$P.flag <- as.factor(AktFinalPred$P.flag)
+
+# Create empty vectors for confusion matrix
+TP <- TN <- FP <- FN <- c()
+
+# Count true positives, true negatives, false positives and false positives
+# Treating 
+TP <- c(TP, sum(AktFinalPred$P.flag == AktFinalPred$dat.extra.ada.akt_cls))[AktFinalPred$P.flag == "1"]
+TN <- c(TN, sum(AktFinalPred$P.flag == AktFinalPred$dat.extra.ada.akt_cls))[AktFinalPred$P.flag == "0"]
+FP <- c(FP, sum((AktFinalPred$P.flag != AktFinalPred$dat.extra.ada.akt_cls)[AktFinalPred$dat.extra.ada.akt_cls == "1"]))
+FP <- c(FP, sum((AktFinalPred$P.flag != AktFinalPred$dat.extra.ada.akt_cls)[AktFinalPred$dat.extra.ada.akt_cls == "0"]))
+
+```
+
+# 12. Conclusion
+Based on above facts and findings, AdaSampling using Random Forrest model with 25 features (mtry) and 800 trees will be selected to be implemented as final classification for Kinase-substrate prediction 
+
+
+
